@@ -79,6 +79,7 @@ let lastDailyResultDate = null;
 let lastDailyTieBreakFinalDate = null;
 
 const pendingFlightReports = new Map();
+const recentPositionCache = new Map();
 
 /* =========================
    GOOGLE SHEETS
@@ -324,6 +325,21 @@ function normalizeNetwork(value) {
   return norm(value).toUpperCase();
 }
 
+function setRecentPosition(discordId, position, timestamp = Date.now()) {
+  const key = pilotKeyFromUsername(discordId);
+  if (!key || !position) return;
+
+  recentPositionCache.set(key, {
+    position: norm(position).toUpperCase(),
+    timestamp
+  });
+}
+
+function getRecentPosition(discordId) {
+  const key = pilotKeyFromUsername(discordId);
+  return recentPositionCache.get(key) || null;
+}
+
 /* =========================
    WEBHOOK HELPERS
 ========================= */
@@ -376,7 +392,7 @@ async function sendInvalidFlightWebhook(discordId, lastLocation, dep) {
       title: '❌ INVALID DEPARTURE LOCATION',
       description:
         `Hello **${discordId}**, your report could not be processed.\n\n` +
-        `📍 **Last known position:** \`${lastLocation}\`\n` +
+        `📍 **Current position:** \`${lastLocation}\`\n` +
         `🛫 **Attempted departure:** \`${dep}\`\n\n` +
         `*Please use Jumpseat to relocate before reporting your flight.*`,
       color: 15548997,
@@ -412,7 +428,7 @@ async function sendInvalidJumpseatWebhook(discordId, lastLocation, dep) {
       title: '❌ INVALID JUMPSEAT ORIGIN',
       description:
         `Hello **${discordId}**, your location did not change because your origin was incorrect.\n\n` +
-        `📍 **Last known position:** \`${lastLocation}\`\n` +
+        `📍 **Current position:** \`${lastLocation}\`\n` +
         `🛫 **Attempted departure:** \`${dep}\``,
       color: 15548997,
       footer: { text: 'Sky Center | Anti-Cheat System' },
@@ -1039,7 +1055,7 @@ async function getPilotsMap() {
 }
 
 async function getFlightStatsMap() {
-  const rows = await getSheetRows(FLIGHTS_SHEET_NAME, 'A:N');
+  const rows = await getSheetRows(FLIGHTS_SHEET_NAME, 'A:M');
   const stats = new Map();
 
   for (let i = 1; i < rows.length; i++) {
@@ -1083,7 +1099,7 @@ async function getFlightStatsMap() {
 }
 
 async function getJumpseatLastPositionMap() {
-  const rows = await getSheetRows(JUMPSEAT_SHEET_NAME, 'A:H');
+  const rows = await getSheetRows(JUMPSEAT_SHEET_NAME, 'A:G');
   const map = new Map();
 
   for (let i = 1; i < rows.length; i++) {
@@ -1119,8 +1135,8 @@ async function getCurrentPositionForPilot(discordId) {
   const pilotsMap = await getPilotsMap();
   const pilot = pilotsMap.get(key) || {};
 
-  const flightsRows = await getSheetRows(FLIGHTS_SHEET_NAME, 'A:N');
-  const jumpseatRows = await getSheetRows(JUMPSEAT_SHEET_NAME, 'A:H');
+  const flightsRows = await getSheetRows(FLIGHTS_SHEET_NAME, 'A:M');
+  const jumpseatRows = await getSheetRows(JUMPSEAT_SHEET_NAME, 'A:G');
 
   let latestPosition = pilot.base || '';
   let latestTime = 0;
@@ -1157,6 +1173,12 @@ async function getCurrentPositionForPilot(discordId) {
       latestTime = timestamp;
       latestPosition = arr;
     }
+  }
+
+  const cached = getRecentPosition(key);
+  if (cached && cached.timestamp > latestTime) {
+    latestTime = cached.timestamp;
+    latestPosition = cached.position;
   }
 
   return {
@@ -1204,6 +1226,12 @@ async function buildPilotStats() {
     if (jump.lastJumpseatTime > lastPositionTime && jump.lastJumpseatArrival) {
       lastPosition = jump.lastJumpseatArrival;
       lastPositionTime = jump.lastJumpseatTime;
+    }
+
+    const cached = getRecentPosition(key);
+    if (cached && cached.timestamp > lastPositionTime) {
+      lastPosition = cached.position;
+      lastPositionTime = cached.timestamp;
     }
 
     result.push({
@@ -1257,7 +1285,7 @@ function resolveTargetDiscordId(interaction) {
 async function appendFlightReportRow(rowValues) {
   await sheets.spreadsheets.values.append({
     spreadsheetId: SPREADSHEET_ID,
-    range: `${FLIGHTS_SHEET_NAME}!A:N`,
+    range: `${FLIGHTS_SHEET_NAME}!A:M`,
     valueInputOption: 'USER_ENTERED',
     insertDataOption: 'INSERT_ROWS',
     requestBody: {
@@ -1269,7 +1297,7 @@ async function appendFlightReportRow(rowValues) {
 async function appendJumpseatRow(rowValues) {
   await sheets.spreadsheets.values.append({
     spreadsheetId: SPREADSHEET_ID,
-    range: `${JUMPSEAT_SHEET_NAME}!A:H`,
+    range: `${JUMPSEAT_SHEET_NAME}!A:G`,
     valueInputOption: 'USER_ENTERED',
     insertDataOption: 'INSERT_ROWS',
     requestBody: {
@@ -1532,21 +1560,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const timestamp = new Date().toISOString();
 
         await appendFlightReportRow([
-          timestamp,
-          data.discordId,
-          data.flightDate,
-          data.dep,
-          data.arr,
-          data.aircraft,
-          data.blockTime,
-          landingRate,
-          network,
-          volantaUrl,
-          'CONFIRMED',
-          currentPosition,
-          '200',
-          'Logged via Discord modal'
+          timestamp,        // A timestamp
+          data.discordId,   // B discord id
+          data.flightDate,  // C date
+          data.dep,         // D dep
+          data.arr,         // E arr
+          data.aircraft,    // F aircraft
+          data.blockTime,   // G block time
+          landingRate,      // H landing rate
+          network,          // I network
+          volantaUrl,       // J volanta link
+          'CONFIRMED',      // K status
+          '200',            // L discord code
+          'Logged via Discord modal' // M notes
         ]);
+
+        setRecentPosition(data.discordId, data.arr, Date.parse(timestamp) || Date.now());
 
         await sendFlightReportWebhook({
           discordId: data.discordId,
@@ -1615,15 +1644,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const timestamp = new Date().toISOString();
 
         await appendJumpseatRow([
-          timestamp,
-          discordId,
-          dep,
-          arr,
-          'CONFIRMED',
-          currentPosition,
-          '200',
-          'Logged via Discord modal'
+          timestamp,      // A timestamp
+          discordId,      // B discord id
+          dep,            // C dep
+          arr,            // D arr
+          'CONFIRMED',    // E status
+          '200',          // F discord code
+          'Logged via Discord modal' // G notes
         ]);
+
+        setRecentPosition(discordId, arr, Date.parse(timestamp) || Date.now());
 
         await sendJumpseatWebhook({
           discordId,
