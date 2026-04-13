@@ -142,9 +142,51 @@ function getBaseFromRoles(member) {
 }
 
 function parseTimestamp(value) {
-  const d = new Date(value);
-  const t = d.getTime();
-  return Number.isNaN(t) ? 0 : t;
+  const raw = norm(value);
+  if (!raw) return 0;
+
+  // 1) Native parse first (works for ISO strings)
+  const native = new Date(raw);
+  const nativeTime = native.getTime();
+  if (!Number.isNaN(nativeTime)) return nativeTime;
+
+  // 2) dd/mm/yyyy hh:mm
+  const matchDateTime = raw.match(
+    /^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:\s+(\d{1,2}):(\d{2}))?$/
+  );
+
+  if (matchDateTime) {
+    const [, dd, mm, yyyy, hh = '0', min = '0'] = matchDateTime;
+    const d = new Date(
+      Number(yyyy),
+      Number(mm) - 1,
+      Number(dd),
+      Number(hh),
+      Number(min)
+    );
+    const t = d.getTime();
+    return Number.isNaN(t) ? 0 : t;
+  }
+
+  // 3) yyyy-mm-dd hh:mm
+  const matchIsoLike = raw.match(
+    /^(\d{4})-(\d{1,2})-(\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?$/
+  );
+
+  if (matchIsoLike) {
+    const [, yyyy, mm, dd, hh = '0', min = '0'] = matchIsoLike;
+    const d = new Date(
+      Number(yyyy),
+      Number(mm) - 1,
+      Number(dd),
+      Number(hh),
+      Number(min)
+    );
+    const t = d.getTime();
+    return Number.isNaN(t) ? 0 : t;
+  }
+
+  return 0;
 }
 
 function parseFlightMinutes(value) {
