@@ -152,12 +152,10 @@ function parseTimestamp(value) {
   const raw = norm(value);
   if (!raw) return 0;
 
-  // 1) Native parse first (ISO, RFC-ish, etc.)
   const native = new Date(raw);
   const nativeTime = native.getTime();
   if (!Number.isNaN(nativeTime)) return nativeTime;
 
-  // 2) dd/mm/yyyy hh:mm:ss
   let match = raw.match(
     /^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2}):(\d{2})$/
   );
@@ -175,7 +173,6 @@ function parseTimestamp(value) {
     return Number.isNaN(t) ? 0 : t;
   }
 
-  // 3) dd/mm/yyyy hh:mm
   match = raw.match(
     /^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})$/
   );
@@ -193,7 +190,6 @@ function parseTimestamp(value) {
     return Number.isNaN(t) ? 0 : t;
   }
 
-  // 4) dd/mm/yyyy
   match = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
   if (match) {
     const [, dd, mm, yyyy] = match;
@@ -202,7 +198,6 @@ function parseTimestamp(value) {
     return Number.isNaN(t) ? 0 : t;
   }
 
-  // 5) yyyy-mm-dd hh:mm:ss
   match = raw.match(
     /^(\d{4})-(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2}):(\d{2})$/
   );
@@ -220,7 +215,6 @@ function parseTimestamp(value) {
     return Number.isNaN(t) ? 0 : t;
   }
 
-  // 6) yyyy-mm-dd hh:mm
   match = raw.match(
     /^(\d{4})-(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2})$/
   );
@@ -335,6 +329,11 @@ function normalizeNetwork(value) {
 ========================= */
 
 async function postDiscordWebhook(url, payload) {
+  if (!url || url.includes('PASTE_YOUR_EXISTING')) {
+    console.warn('Webhook URL is not configured.');
+    return { ok: false, code: 0 };
+  }
+
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -959,13 +958,8 @@ async function upsertPilotFromMember(member) {
     const oldNotes = norm(existing.values[3]) || 'Bot sync';
     const oldInServer = norm(existing.values[4]).toUpperCase() || 'YES';
 
-    if (!payload.baseAirport && oldBase) {
-      payload.baseAirport = oldBase;
-    }
-
-    if (oldNotes && oldNotes !== 'Bot sync') {
-      payload.notes = oldNotes;
-    }
+    if (!payload.baseAirport && oldBase) payload.baseAirport = oldBase;
+    if (oldNotes && oldNotes !== 'Bot sync') payload.notes = oldNotes;
 
     const hasMeaningfulChange =
       payload.baseAirport !== oldBase ||
@@ -973,9 +967,7 @@ async function upsertPilotFromMember(member) {
       payload.notes !== oldNotes ||
       payload.inServer !== oldInServer;
 
-    if (!hasMeaningfulChange) {
-      return;
-    }
+    if (!hasMeaningfulChange) return;
 
     await updatePilotRow(existing.rowNumber, payload);
     console.log(`Updated pilot: ${discordId} -> ${payload.baseAirport || '(no base)'}`);
@@ -1081,7 +1073,7 @@ async function getFlightStatsMap() {
       s.bestLanding = landing;
     }
 
-    if (timestamp >= s.lastFlightTime) {
+    if (timestamp > s.lastFlightTime) {
       s.lastFlightTime = timestamp;
       s.lastFlightArrival = arr;
     }
@@ -1112,13 +1104,66 @@ async function getJumpseatLastPositionMap() {
     }
 
     const s = map.get(discordId);
-    if (timestamp >= s.lastJumpseatTime) {
+    if (timestamp > s.lastJumpseatTime) {
       s.lastJumpseatTime = timestamp;
       s.lastJumpseatArrival = arr;
     }
   }
 
   return map;
+}
+
+async function getCurrentPositionForPilot(discordId) {
+  const key = pilotKeyFromUsername(discordId);
+
+  const pilotsMap = await getPilotsMap();
+  const pilot = pilotsMap.get(key) || {};
+
+  const flightsRows = await getSheetRows(FLIGHTS_SHEET_NAME, 'A:N');
+  const jumpseatRows = await getSheetRows(JUMPSEAT_SHEET_NAME, 'A:H');
+
+  let latestPosition = pilot.base || '';
+  let latestTime = 0;
+
+  for (let i = 1; i < flightsRows.length; i++) {
+    const row = flightsRows[i];
+    const rowPilot = pilotKeyFromUsername(row[1]);
+    const status = norm(row[10]).toUpperCase();
+    const arr = norm(row[4]).toUpperCase();
+    const timestamp = parseTimestamp(row[0]);
+
+    if (rowPilot !== key) continue;
+    if (status !== 'CONFIRMED') continue;
+    if (!arr) continue;
+
+    if (timestamp > latestTime) {
+      latestTime = timestamp;
+      latestPosition = arr;
+    }
+  }
+
+  for (let i = 1; i < jumpseatRows.length; i++) {
+    const row = jumpseatRows[i];
+    const rowPilot = pilotKeyFromUsername(row[1]);
+    const status = norm(row[4]).toUpperCase();
+    const arr = norm(row[3]).toUpperCase();
+    const timestamp = parseTimestamp(row[0]);
+
+    if (rowPilot !== key) continue;
+    if (status !== 'CONFIRMED') continue;
+    if (!arr) continue;
+
+    if (timestamp > latestTime) {
+      latestTime = timestamp;
+      latestPosition = arr;
+    }
+  }
+
+  return {
+    base: pilot.base || '',
+    currentPosition: latestPosition || pilot.base || '',
+    latestTime
+  };
 }
 
 async function buildPilotStats() {
@@ -1459,17 +1504,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        const stats = await getStatsForPilot(data.discordId);
+        const positionData = await getCurrentPositionForPilot(data.discordId);
 
-        if (!stats) {
-          pendingFlightReports.delete(interaction.user.id);
-          await interaction.editReply({
-            content: `No pilot profile found for **${data.discordId}**.`
-          });
-          return;
-        }
-
-        if (!stats.base) {
+        if (!positionData.base) {
           pendingFlightReports.delete(interaction.user.id);
           await interaction.editReply({
             content: 'You do not have a base assigned yet.'
@@ -1477,7 +1514,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        const currentPosition = stats.lastPosition || stats.base;
+        const currentPosition = positionData.currentPosition || positionData.base;
 
         if (currentPosition && data.dep !== currentPosition) {
           await sendInvalidFlightWebhook(data.discordId, currentPosition, data.dep);
@@ -1553,23 +1590,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        const stats = await getStatsForPilot(discordId);
+        const positionData = await getCurrentPositionForPilot(discordId);
 
-        if (!stats) {
-          await interaction.editReply({
-            content: `No pilot profile found for **${discordId}**.`
-          });
-          return;
-        }
-
-        if (!stats.base) {
+        if (!positionData.base) {
           await interaction.editReply({
             content: 'You do not have a base assigned yet.'
           });
           return;
         }
 
-        const currentPosition = stats.lastPosition || stats.base;
+        const currentPosition = positionData.currentPosition || positionData.base;
 
         if (currentPosition && dep !== currentPosition) {
           await sendInvalidJumpseatWebhook(discordId, currentPosition, dep);
