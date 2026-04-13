@@ -5,9 +5,20 @@ const {
   GatewayIntentBits,
   Events,
   SlashCommandBuilder,
-  EmbedBuilder
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  MessageFlags
 } = require('discord.js');
 const { google } = require('googleapis');
+
+/* =========================
+   ENV / CONSTANTS
+========================= */
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
@@ -27,9 +38,12 @@ const ROUTES_SHEET_NAME = 'Routes';
 const DAILY_SUGGESTIONS_CHANNEL_ID = '1492448304460599406';
 const PILOTS_ROLE_ID = '1492451469876527164';
 
+const FLIGHT_REPORT_WEBHOOK_URL = 'https://discord.com/api/webhooks/1492487689885319188/5CM2UyGouqWcIC5X7hMtJVyDzPU9Pr1zmtTU2wBGL2WiS_fQ16PEUr1JICppiJK-H7qL';
+const JUMPSEAT_WEBHOOK_URL = 'https://discord.com/api/webhooks/1492504377037033644/lrKGAI0XyYPLFRPIA3haEsULMuFm49vEx4YTQl0-xEsVMDRJZtpkoObaun8wULqOm-Ip';
+
 const DAILY_SUGGESTION_HOUR_UTC = 11;
-const DAILY_RESULT_HOUR_UTC = 17;
-const DAILY_TIEBREAK_RESULT_HOUR_UTC = 17;
+const DAILY_RESULT_HOUR_UTC = 16;
+const DAILY_TIEBREAK_RESULT_HOUR_UTC = 16;
 const DAILY_TIEBREAK_RESULT_MINUTE_UTC = 30;
 
 if (
@@ -49,24 +63,22 @@ console.log(
     : 'KEY FORMAT INVALID'
 );
 
-console.log('EMAIL OK:', !!process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL);
-console.log('KEY OK:', !!process.env.GOOGLE_PRIVATE_KEY);
-console.log('KEY LENGTH:', (process.env.GOOGLE_PRIVATE_KEY || '').length);
-
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildMessageReactions,
-    GatewayIntentBits.GuildMessages
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildMessageReactions
   ]
 });
 
 let sheets;
+
 let lastDailySuggestionDate = null;
 let lastDailyResultDate = null;
-let lastDailyTieBreakDate = null;
 let lastDailyTieBreakFinalDate = null;
+
+const pendingFlightReports = new Map();
 
 /* =========================
    GOOGLE SHEETS
@@ -76,16 +88,16 @@ async function initGoogleSheets() {
   const auth = new google.auth.GoogleAuth({
     credentials: {
       client_email: GOOGLE_SERVICE_ACCOUNT_EMAIL,
-      private_key: GOOGLE_PRIVATE_KEY,
+      private_key: GOOGLE_PRIVATE_KEY
     },
-    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    scopes: ['https://www.googleapis.com/auth/spreadsheets']
   });
 
   const authClient = await auth.getClient();
 
   sheets = google.sheets({
     version: 'v4',
-    auth: authClient,
+    auth: authClient
   });
 
   console.log('Google Sheets auth OK');
@@ -208,6 +220,121 @@ function getTodayUtcKey(date = new Date()) {
   return `${y}-${m}-${d}`;
 }
 
+function isValidICAO(value) {
+  return /^[A-Z]{4}$/.test(norm(value).toUpperCase());
+}
+
+function isValidFlightDate(value) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(norm(value));
+}
+
+function isValidBlockTime(value) {
+  return /^\d{1,2}:\d{2}$/.test(norm(value));
+}
+
+function normalizeNetwork(value) {
+  return norm(value).toUpperCase();
+}
+
+/* =========================
+   WEBHOOK HELPERS
+========================= */
+
+async function postDiscordWebhook(url, payload) {
+  if (!url || url.includes('PASTE_YOUR_EXISTING')) {
+    console.warn('Webhook URL is not configured.');
+    return { ok: false, code: 0 };
+  }
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+
+  return { ok: res.ok, code: res.status };
+}
+
+async function sendFlightReportWebhook(report) {
+  const payload = {
+    embeds: [{
+      title: '✈️ NEW FLIGHT REPORT | SKY CENTER',
+      color: 15105570,
+      fields: [
+        { name: '👨‍✈️ Pilot', value: report.discordId, inline: true },
+        { name: '📅 Date', value: report.flightDate, inline: true },
+        { name: '🌐 Network', value: report.network, inline: true },
+        { name: '🛫 DEP', value: `\`${report.dep}\``, inline: true },
+        { name: '🛬 ARR', value: `\`${report.arr}\``, inline: true },
+        { name: '✈️ Plane', value: report.aircraft, inline: true },
+        { name: '⏱️ Block Time', value: `${report.blockTime} h`, inline: true },
+        { name: '📉 LDG rate', value: `${report.landingRate} fpm`, inline: true },
+        {
+          name: '🔗 Volanta link',
+          value: report.volantaUrl ? `[Flight Analysis](${report.volantaUrl})` : 'N/A'
+        }
+      ],
+      footer: { text: 'Sky Center Simulation | Operations System' },
+      timestamp: new Date().toISOString()
+    }]
+  };
+
+  return postDiscordWebhook(FLIGHT_REPORT_WEBHOOK_URL, payload);
+}
+
+async function sendInvalidFlightWebhook(discordId, lastLocation, dep) {
+  const payload = {
+    embeds: [{
+      title: '❌ INVALID DEPARTURE LOCATION',
+      description:
+        `Hello **${discordId}**, your report could not be processed.\n\n` +
+        `📍 **Last known position:** \`${lastLocation}\`\n` +
+        `🛫 **Attempted departure:** \`${dep}\`\n\n` +
+        `*Please use Jumpseat to relocate before reporting your flight.*`,
+      color: 15548997,
+      footer: { text: 'Sky Center Simulation | Operations System' },
+      timestamp: new Date().toISOString()
+    }]
+  };
+
+  return postDiscordWebhook(FLIGHT_REPORT_WEBHOOK_URL, payload);
+}
+
+async function sendJumpseatWebhook(report) {
+  const payload = {
+    embeds: [{
+      title: '🎫 PILOT JUMPSEAT | COMPLETED',
+      color: 3447003,
+      fields: [
+        { name: '👨‍✈️ Pilot', value: report.discordId, inline: true },
+        { name: '🛫 Departure', value: `\`${report.dep}\``, inline: true },
+        { name: '🛬 Destination', value: `\`${report.arr}\``, inline: true }
+      ],
+      footer: { text: 'Sky Center Simulation | Logistics System' },
+      timestamp: new Date().toISOString()
+    }]
+  };
+
+  return postDiscordWebhook(JUMPSEAT_WEBHOOK_URL, payload);
+}
+
+async function sendInvalidJumpseatWebhook(discordId, lastLocation, dep) {
+  const payload = {
+    embeds: [{
+      title: '❌ INVALID JUMPSEAT ORIGIN',
+      description:
+        `Hello **${discordId}**, your location does not changed because your origin was incorrect.\n\n` +
+        `📍 **Last known position:** \`${lastLocation}\`\n` +
+        `🛫 **Attempted departure:** \`${dep}\``,
+      color: 15548997,
+      footer: { text: 'Sky Center | Anti-Cheat System' },
+      timestamp: new Date().toISOString()
+    }]
+  };
+
+  return postDiscordWebhook(JUMPSEAT_WEBHOOK_URL, payload);
+}
+
 /* =========================
    ROUTES / DAILY SUGGESTIONS
 ========================= */
@@ -258,7 +385,7 @@ async function sendDailySuggestions() {
     .setTitle('✈️ Daily Flight Suggestions')
     .setDescription(
       'Good morning, pilots.\n\n' +
-      'Today’s route board for **18:00Z** is now open. Below you will find one **Short Haul**, one **Medium Haul**, and one **Long Haul** option.\n\n' +
+      'Today’s route board for **16:00Z** is now open. Below you will find one **Short Haul**, one **Medium Haul**, and one **Long Haul** option.\n\n' +
       'Vote for the route you want us to operate this afternoon.'
     )
     .addFields(
@@ -279,7 +406,7 @@ async function sendDailySuggestions() {
       }
     )
     .setColor(0x00b894)
-    .setFooter({ text: 'Sky Center • Voting closes at 17:00Z' })
+    .setFooter({ text: 'Sky Center • Voting closes at 15:00Z' })
     .setTimestamp();
 
   const message = await channel.send({
@@ -388,11 +515,10 @@ async function sendDailyResultAnnouncement() {
     const resultEmbed = new EmbedBuilder()
       .setTitle('📢 Daily Operation Result')
       .setDescription(
-        'Voting for today’s **18:00Z** operation has now closed.\n\n' +
+        'Voting for today’s **15:00Z** operation has now closed.\n\n' +
         'No votes were cast for the available routes, so there is **no official flight selection** for today.\n\n' +
-        '**See you all in the briefing room at 18:00Z.**'
+        '**See you all in the briefing room at 16:00Z.**'
       )
-      .setColor(0x95a5a6)
       .addFields(
         {
           name: '1️⃣ Short Haul',
@@ -410,6 +536,7 @@ async function sendDailyResultAnnouncement() {
           inline: false
         }
       )
+      .setColor(0x95a5a6)
       .setFooter({ text: 'Sky Center • Daily Result' })
       .setTimestamp();
 
@@ -429,8 +556,8 @@ async function sendDailyResultAnnouncement() {
       .setTitle('⚖️ Tie-Break Poll')
       .setDescription(
         'The daily voting has ended in a **tie**.\n\n' +
-        'A rapid tie-break vote is now open and will close at **17:30Z**.\n\n' +
-        'Please vote again to decide today’s official operation for **18:00Z**.'
+        'A rapid tie-break vote is now open and will close at **15:30Z**.\n\n' +
+        'Please vote again to decide today’s official operation for **16:00Z**.'
       )
       .addFields(
         {
@@ -445,7 +572,7 @@ async function sendDailyResultAnnouncement() {
         }
       )
       .setColor(0xf39c12)
-      .setFooter({ text: 'Sky Center • Tie-break closes at 17:30Z' })
+      .setFooter({ text: 'Sky Center • Tie-break closes at 15:30Z' })
       .setTimestamp();
 
     const tieMessage = await channel.send({
@@ -463,12 +590,12 @@ async function sendDailyResultAnnouncement() {
   const resultEmbed = new EmbedBuilder()
     .setTitle('🏆 Official Flight of the Day')
     .setDescription(
-      'Voting for today’s **18:00Z** operation has officially closed.\n\n' +
+      'Voting for today’s **16:00Z** operation has officially closed.\n\n' +
       'After today’s community vote, the selected route for this afternoon is:\n\n' +
       `✈️ **${winner.category}**\n${winner.route}\n\n` +
       `🗳 **Final Votes:** ${winner.votes}\n\n` +
       'All pilots are encouraged to prepare charts, briefing material and operational setup for the selected route.\n\n' +
-      '**See you all in the briefing room at 18:00Z.**'
+      '**See you all in the briefing room at 16:00Z.**'
     )
     .addFields(
       {
@@ -491,10 +618,10 @@ async function sendDailyResultAnnouncement() {
     .setFooter({ text: 'Sky Center • Official Daily Operation' })
     .setTimestamp();
 
-  await channel.send({
-    content: roleMention(),
-    embeds: [resultEmbed]
-  });
+    await channel.send({
+      content: roleMention(),
+      embeds: [resultEmbed]
+    });
 
   console.log('Daily final winner announcement sent');
 }
@@ -530,7 +657,7 @@ async function sendTieBreakFinalAnnouncement() {
         'The tie-break vote has now closed.\n\n' +
         'No votes were cast during the tie-break, so both routes remain unresolved.\n\n' +
         'Operations staff may choose the final route manually.\n\n' +
-        '**See you all in the briefing room at 18:00Z.**'
+        '**See you all in the briefing room at 16:00Z.**'
       )
       .addFields(
         {
@@ -566,7 +693,7 @@ async function sendTieBreakFinalAnnouncement() {
         `**Option A**\n${optionA}\n\n` +
         `**Option B**\n${optionB}\n\n` +
         'Pilots may operate either of the two tied routes unless staff decides otherwise.\n\n' +
-        '**See you all in the briefing room at 18:00Z.**'
+        '**See you all in the briefing room at 16:00Z.**'
       )
       .addFields(
         {
@@ -600,11 +727,11 @@ async function sendTieBreakFinalAnnouncement() {
   const resultEmbed = new EmbedBuilder()
     .setTitle('🏆 Official Flight of the Day')
     .setDescription(
-      'The tie-break vote has now closed, and today’s official route for the **18:00Z** operation is:\n\n' +
+      'The tie-break vote has now closed, and today’s official route for the **16:00Z** operation is:\n\n' +
       `✈️ **${winnerLabel}**\n${winnerRoute}\n\n` +
       `🗳 **Winning Votes:** ${winnerVotes}\n\n` +
       'Briefing and preparation should now proceed for the selected route.\n\n' +
-      '**See you all in the briefing room at 18:00Z.**'
+      '**See you all in the briefing room at 16:00Z.**'
     )
     .addFields(
       {
@@ -622,10 +749,10 @@ async function sendTieBreakFinalAnnouncement() {
     .setFooter({ text: 'Sky Center • Tie-Break Winner' })
     .setTimestamp();
 
-    await channel.send({
-      content: roleMention(),
-      embeds: [resultEmbed]
-    });
+  await channel.send({
+    content: roleMention(),
+    embeds: [resultEmbed]
+  });
 
   console.log('Tie-break final winner announcement sent');
 }
@@ -787,7 +914,7 @@ async function initialSync() {
 }
 
 /* =========================
-   STATS / RANKINGS
+   STATS / POSITION
 ========================= */
 
 async function getPilotsMap() {
@@ -972,7 +1099,33 @@ function resolveTargetDiscordId(interaction) {
 }
 
 /* =========================
-   SLASH COMMANDS
+   SHEET APPENDERS
+========================= */
+
+async function appendFlightReportRow(rowValues) {
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${FLIGHTS_SHEET_NAME}!A:N`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: {
+      values: [rowValues]
+    }
+  });
+}
+
+async function appendJumpseatRow(rowValues) {
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${JUMPSEAT_SHEET_NAME}!A:H`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: {
+      values: [rowValues]
+    }
+  });
+}
+
+/* =========================
+   COMMANDS
 ========================= */
 
 async function registerCommands() {
@@ -1007,7 +1160,27 @@ async function registerCommands() {
 
     new SlashCommandBuilder()
       .setName('suggestflights')
-      .setDescription('Show 3 suggested flights: short, medium and long haul')
+      .setDescription('Show 3 suggested flights: short, medium and long haul'),
+
+    new SlashCommandBuilder()
+      .setName('reportflight')
+      .setDescription('Log a flight directly from Discord'),
+
+    new SlashCommandBuilder()
+      .setName('jumpseat')
+      .setDescription('Log a jumpseat directly from Discord'),
+
+    new SlashCommandBuilder()
+      .setName('forceroutepoll')
+      .setDescription('Send the daily route poll right now'),
+
+    new SlashCommandBuilder()
+      .setName('forceresult')
+      .setDescription('Send the daily result right now'),
+
+    new SlashCommandBuilder()
+      .setName('forcetiebreakresult')
+      .setDescription('Send the tie-break final result right now')
   ].map(command => command.toJSON());
 
   const guild = await client.guilds.fetch(GUILD_ID);
@@ -1015,16 +1188,328 @@ async function registerCommands() {
   console.log('Slash commands registered');
 }
 
-client.on(Events.InteractionCreate, async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
+/* =========================
+   INTERACTIONS
+========================= */
 
+client.on(Events.InteractionCreate, async (interaction) => {
   try {
+    if (interaction.isButton()) {
+      if (interaction.customId === 'reportflight_continue') {
+        const draft = pendingFlightReports.get(interaction.user.id);
+
+        if (!draft) {
+          await interaction.reply({
+            content: 'This flight report draft has expired. Please use **/reportflight** again.',
+            flags: MessageFlags.Ephemeral
+          });
+          return;
+        }
+
+        const modal = new ModalBuilder()
+          .setCustomId('reportflight_step2')
+          .setTitle('Flight Report • Step 2/2');
+
+        const ldgInput = new TextInputBuilder()
+          .setCustomId('landing_rate')
+          .setLabel('Landing Rate')
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setPlaceholder('-180');
+
+        const networkInput = new TextInputBuilder()
+          .setCustomId('network')
+          .setLabel('Network')
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setPlaceholder('VATSIM / IVAO / OFFLINE');
+
+        const volantaInput = new TextInputBuilder()
+          .setCustomId('volanta_url')
+          .setLabel('Volanta Link')
+          .setStyle(TextInputStyle.Short)
+          .setRequired(false)
+          .setPlaceholder('https://volanta.app/...');
+
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(ldgInput),
+          new ActionRowBuilder().addComponents(networkInput),
+          new ActionRowBuilder().addComponents(volantaInput)
+        );
+
+        await interaction.showModal(modal);
+        return;
+      }
+
+      if (interaction.customId === 'reportflight_cancel') {
+        pendingFlightReports.delete(interaction.user.id);
+
+        await interaction.update({
+          content: 'Flight report cancelled.',
+          embeds: [],
+          components: []
+        });
+        return;
+      }
+    }
+
+    if (interaction.isModalSubmit()) {
+      if (interaction.customId === 'reportflight_step1') {
+        const dep = norm(interaction.fields.getTextInputValue('dep')).toUpperCase();
+        const arr = norm(interaction.fields.getTextInputValue('arr')).toUpperCase();
+        const date = norm(interaction.fields.getTextInputValue('date'));
+        const aircraft = norm(interaction.fields.getTextInputValue('aircraft')).toUpperCase();
+        const blockTime = norm(interaction.fields.getTextInputValue('block_time'));
+
+        if (!isValidICAO(dep) || !isValidICAO(arr)) {
+          await interaction.reply({
+            content: 'Invalid ICAO format. Please use valid 4-letter ICAO codes.',
+            flags: MessageFlags.Ephemeral
+          });
+          return;
+        }
+
+        if (!isValidFlightDate(date)) {
+          await interaction.reply({
+            content: 'Invalid date format. Please use **YYYY-MM-DD**.',
+            flags: MessageFlags.Ephemeral
+          });
+          return;
+        }
+
+        if (!isValidBlockTime(blockTime)) {
+          await interaction.reply({
+            content: 'Invalid block time format. Please use **HH:MM**.',
+            flags: MessageFlags.Ephemeral
+          });
+          return;
+        }
+
+        pendingFlightReports.set(interaction.user.id, {
+          discordId: pilotKeyFromUsername(interaction.user.username),
+          dep,
+          arr,
+          flightDate: date,
+          aircraft,
+          blockTime
+        });
+
+        const embed = new EmbedBuilder()
+          .setTitle('Flight Report • Step 1 Complete')
+          .setDescription(
+            `Your flight draft has been saved.\n\n` +
+            `**Departure:** ${dep}\n` +
+            `**Arrival:** ${arr}\n` +
+            `**Date:** ${date}\n` +
+            `**Aircraft:** ${aircraft}\n` +
+            `**Block Time:** ${blockTime}\n\n` +
+            `Click **Continue** to complete the report.`
+          )
+          .setColor(0x3498db);
+
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId('reportflight_continue')
+            .setLabel('Continue')
+            .setStyle(ButtonStyle.Success),
+          new ButtonBuilder()
+            .setCustomId('reportflight_cancel')
+            .setLabel('Cancel')
+            .setStyle(ButtonStyle.Danger)
+        );
+
+        await interaction.reply({
+          embeds: [embed],
+          components: [row],
+          flags: MessageFlags.Ephemeral
+        });
+        return;
+      }
+
+      if (interaction.customId === 'reportflight_step2') {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+        const data = pendingFlightReports.get(interaction.user.id);
+
+        if (!data) {
+          await interaction.editReply({
+            content: 'This flight report draft has expired. Please use **/reportflight** again.'
+          });
+          return;
+        }
+
+        const landingRateRaw = norm(interaction.fields.getTextInputValue('landing_rate'));
+        const network = normalizeNetwork(interaction.fields.getTextInputValue('network'));
+        const volantaUrl = norm(interaction.fields.getTextInputValue('volanta_url'));
+
+        const landingRate = parseInt(landingRateRaw, 10);
+        if (Number.isNaN(landingRate)) {
+          await interaction.editReply({
+            content: 'Invalid landing rate. Please enter a valid integer value, e.g. **-180**.'
+          });
+          return;
+        }
+
+        const stats = await getStatsForPilot(data.discordId);
+
+        if (!stats) {
+          pendingFlightReports.delete(interaction.user.id);
+          await interaction.editReply({
+            content: `No pilot profile found for **${data.discordId}**.`
+          });
+          return;
+        }
+
+        if (!stats.base) {
+          pendingFlightReports.delete(interaction.user.id);
+          await interaction.editReply({
+            content: 'You do not have a base assigned yet.'
+          });
+          return;
+        }
+
+        const currentPosition = stats.lastPosition || stats.base;
+
+        if (currentPosition && data.dep !== currentPosition) {
+          await sendInvalidFlightWebhook(data.discordId, currentPosition, data.dep);
+          pendingFlightReports.delete(interaction.user.id);
+
+          await interaction.editReply({
+            content:
+              `Invalid departure location.\n\n` +
+              `Your current position is **${currentPosition}** but you tried to depart from **${data.dep}**.\n` +
+              `Please use **/jumpseat** first if you need to reposition.`
+          });
+          return;
+        }
+
+        const timestamp = new Date().toISOString();
+
+        await appendFlightReportRow([
+          timestamp,
+          data.discordId,
+          data.flightDate,
+          data.dep,
+          data.arr,
+          data.aircraft,
+          data.blockTime,
+          landingRate,
+          network,
+          volantaUrl,
+          'CONFIRMED',
+          currentPosition,
+          '200',
+          'Logged via Discord modal'
+        ]);
+
+        await sendFlightReportWebhook({
+          discordId: data.discordId,
+          flightDate: data.flightDate,
+          dep: data.dep,
+          arr: data.arr,
+          aircraft: data.aircraft,
+          blockTime: data.blockTime,
+          landingRate,
+          network,
+          volantaUrl
+        });
+
+        pendingFlightReports.delete(interaction.user.id);
+
+        await interaction.editReply({
+          content:
+            `✅ Flight logged successfully.\n\n` +
+            `**Pilot:** ${data.discordId}\n` +
+            `**Route:** ${data.dep} → ${data.arr}\n` +
+            `**Date:** ${data.flightDate}\n` +
+            `**Aircraft:** ${data.aircraft}\n` +
+            `**Block Time:** ${data.blockTime}\n` +
+            `**Landing Rate:** ${landingRate} fpm`
+        });
+        return;
+      }
+
+      if (interaction.customId === 'jumpseat_modal') {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+        const discordId = pilotKeyFromUsername(interaction.user.username);
+
+        const dep = norm(interaction.fields.getTextInputValue('dep')).toUpperCase();
+        const arr = norm(interaction.fields.getTextInputValue('arr')).toUpperCase();
+
+        if (!isValidICAO(dep) || !isValidICAO(arr)) {
+          await interaction.editReply({
+            content: 'Invalid ICAO format. Please use valid 4-letter ICAO codes.'
+          });
+          return;
+        }
+
+        const stats = await getStatsForPilot(discordId);
+
+        if (!stats) {
+          await interaction.editReply({
+            content: `No pilot profile found for **${discordId}**.`
+          });
+          return;
+        }
+
+        if (!stats.base) {
+          await interaction.editReply({
+            content: 'You do not have a base assigned yet.'
+          });
+          return;
+        }
+
+        const currentPosition = stats.lastPosition || stats.base;
+
+        if (currentPosition && dep !== currentPosition) {
+          await sendInvalidJumpseatWebhook(discordId, currentPosition, dep);
+
+          await interaction.editReply({
+            content:
+              `Invalid jumpseat origin.\n\n` +
+              `Your current position is **${currentPosition}** but you tried to depart from **${dep}**.`
+          });
+          return;
+        }
+
+        const timestamp = new Date().toISOString();
+
+        await appendJumpseatRow([
+          timestamp,
+          discordId,
+          dep,
+          arr,
+          'CONFIRMED',
+          currentPosition,
+          '200',
+          'Logged via Discord modal'
+        ]);
+
+        await sendJumpseatWebhook({
+          discordId,
+          dep,
+          arr
+        });
+
+        await interaction.editReply({
+          content:
+            `✅ Jumpseat logged successfully.\n\n` +
+            `**Pilot:** ${discordId}\n` +
+            `**Route:** ${dep} → ${arr}`
+        });
+        return;
+      }
+    }
+
+    if (!interaction.isChatInputCommand()) return;
+
     if (interaction.commandName === 'ranking') {
       const ranking = await getRankingByHours();
       const top5 = ranking.slice(0, 5);
 
       if (!top5.length) {
-        await interaction.reply({ content: 'No confirmed flights found yet.', ephemeral: true });
+        await interaction.reply({ content: 'No confirmed flights found yet.', flags: MessageFlags.Ephemeral });
         return;
       }
 
@@ -1050,7 +1535,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const index = ranking.findIndex(p => p.discordId === targetId);
 
       if (index === -1) {
-        await interaction.reply({ content: `No confirmed flights found for **${targetId}**.`, ephemeral: true });
+        await interaction.reply({
+          content: `No confirmed flights found for **${targetId}**.`,
+          flags: MessageFlags.Ephemeral
+        });
         return;
       }
 
@@ -1077,7 +1565,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const stats = await getStatsForPilot(targetId);
 
       if (!stats) {
-        await interaction.reply({ content: `No data found for **${targetId}**.`, ephemeral: true });
+        await interaction.reply({
+          content: `No data found for **${targetId}**.`,
+          flags: MessageFlags.Ephemeral
+        });
         return;
       }
 
@@ -1103,7 +1594,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const top5 = ranking.slice(0, 5);
 
       if (!top5.length) {
-        await interaction.reply({ content: 'No confirmed landings found yet.', ephemeral: true });
+        await interaction.reply({
+          content: 'No confirmed landings found yet.',
+          flags: MessageFlags.Ephemeral
+        });
         return;
       }
 
@@ -1152,19 +1646,132 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await interaction.reply({ embeds: [embed] });
       return;
     }
+
+    if (interaction.commandName === 'reportflight') {
+      const modal = new ModalBuilder()
+        .setCustomId('reportflight_step1')
+        .setTitle('Flight Report • Step 1/2');
+
+      const depInput = new TextInputBuilder()
+        .setCustomId('dep')
+        .setLabel('Departure ICAO')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setPlaceholder('GCLP');
+
+      const arrInput = new TextInputBuilder()
+        .setCustomId('arr')
+        .setLabel('Arrival ICAO')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setPlaceholder('LEMD');
+
+      const dateInput = new TextInputBuilder()
+        .setCustomId('date')
+        .setLabel('Flight Date (YYYY-MM-DD)')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setPlaceholder('2026-04-15');
+
+      const aircraftInput = new TextInputBuilder()
+        .setCustomId('aircraft')
+        .setLabel('Aircraft Type')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setPlaceholder('A320');
+
+      const blockTimeInput = new TextInputBuilder()
+        .setCustomId('block_time')
+        .setLabel('Block Time (HH:MM)')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setPlaceholder('02:35');
+
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(depInput),
+        new ActionRowBuilder().addComponents(arrInput),
+        new ActionRowBuilder().addComponents(dateInput),
+        new ActionRowBuilder().addComponents(aircraftInput),
+        new ActionRowBuilder().addComponents(blockTimeInput)
+      );
+
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.commandName === 'jumpseat') {
+      const modal = new ModalBuilder()
+        .setCustomId('jumpseat_modal')
+        .setTitle('Jumpseat Report');
+
+      const depInput = new TextInputBuilder()
+        .setCustomId('dep')
+        .setLabel('Departure ICAO')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setPlaceholder('LEMD');
+
+      const arrInput = new TextInputBuilder()
+        .setCustomId('arr')
+        .setLabel('Arrival ICAO')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setPlaceholder('EGLL');
+
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(depInput),
+        new ActionRowBuilder().addComponents(arrInput)
+      );
+
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.commandName === 'forceroutepoll') {
+      await sendDailySuggestions();
+      await interaction.reply({
+        content: 'Daily route poll sent successfully.',
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
+
+    if (interaction.commandName === 'forceresult') {
+      await sendDailyResultAnnouncement();
+      await interaction.reply({
+        content: 'Daily result announcement sent successfully.',
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
+
+    if (interaction.commandName === 'forcetiebreakresult') {
+      await sendTieBreakFinalAnnouncement();
+      await interaction.reply({
+        content: 'Tie-break final result sent successfully.',
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
   } catch (err) {
     console.error('Interaction error:', err);
-    const content = 'An error occurred while executing this command.';
+
+    const content = 'An error occurred while executing this action.';
+
     if (interaction.replied || interaction.deferred) {
-      await interaction.followUp({ content, ephemeral: true });
+      try {
+        await interaction.followUp({ content, flags: MessageFlags.Ephemeral });
+      } catch {}
     } else {
-      await interaction.reply({ content, ephemeral: true });
+      try {
+        await interaction.reply({ content, flags: MessageFlags.Ephemeral });
+      } catch {}
     }
   }
 });
 
 /* =========================
-   READY / EVENTS
+   READY / MEMBER EVENTS
 ========================= */
 
 client.once(Events.ClientReady, async (readyClient) => {
