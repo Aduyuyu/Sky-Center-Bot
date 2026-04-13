@@ -141,46 +141,98 @@ function getBaseFromRoles(member) {
   return '';
 }
 
+function getBaseRoleIdFromMember(member) {
+  for (const roleId of member.roles.cache.keys()) {
+    if (BASE_ROLES[roleId]) return roleId;
+  }
+  return null;
+}
+
 function parseTimestamp(value) {
   const raw = norm(value);
   if (!raw) return 0;
 
-  // ISO / native parse
+  // 1) Native parse first (ISO, RFC-ish, etc.)
   const native = new Date(raw);
   const nativeTime = native.getTime();
   if (!Number.isNaN(nativeTime)) return nativeTime;
 
-  // dd/mm/yyyy hh:mm or dd/mm/yyyy
-  const match1 = raw.match(
-    /^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:\s+(\d{1,2}):(\d{2}))?$/
+  // 2) dd/mm/yyyy hh:mm:ss
+  let match = raw.match(
+    /^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2}):(\d{2})$/
   );
-
-  if (match1) {
-    const [, dd, mm, yyyy, hh = '0', min = '0'] = match1;
+  if (match) {
+    const [, dd, mm, yyyy, hh, min, ss] = match;
     const d = new Date(
       Number(yyyy),
       Number(mm) - 1,
       Number(dd),
       Number(hh),
-      Number(min)
+      Number(min),
+      Number(ss)
     );
     const t = d.getTime();
     return Number.isNaN(t) ? 0 : t;
   }
 
-  // yyyy-mm-dd hh:mm or yyyy-mm-dd
-  const match2 = raw.match(
-    /^(\d{4})-(\d{1,2})-(\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?$/
+  // 3) dd/mm/yyyy hh:mm
+  match = raw.match(
+    /^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})$/
   );
-
-  if (match2) {
-    const [, yyyy, mm, dd, hh = '0', min = '0'] = match2;
+  if (match) {
+    const [, dd, mm, yyyy, hh, min] = match;
     const d = new Date(
       Number(yyyy),
       Number(mm) - 1,
       Number(dd),
       Number(hh),
-      Number(min)
+      Number(min),
+      0
+    );
+    const t = d.getTime();
+    return Number.isNaN(t) ? 0 : t;
+  }
+
+  // 4) dd/mm/yyyy
+  match = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (match) {
+    const [, dd, mm, yyyy] = match;
+    const d = new Date(Number(yyyy), Number(mm) - 1, Number(dd), 0, 0, 0);
+    const t = d.getTime();
+    return Number.isNaN(t) ? 0 : t;
+  }
+
+  // 5) yyyy-mm-dd hh:mm:ss
+  match = raw.match(
+    /^(\d{4})-(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2}):(\d{2})$/
+  );
+  if (match) {
+    const [, yyyy, mm, dd, hh, min, ss] = match;
+    const d = new Date(
+      Number(yyyy),
+      Number(mm) - 1,
+      Number(dd),
+      Number(hh),
+      Number(min),
+      Number(ss)
+    );
+    const t = d.getTime();
+    return Number.isNaN(t) ? 0 : t;
+  }
+
+  // 6) yyyy-mm-dd hh:mm
+  match = raw.match(
+    /^(\d{4})-(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2})$/
+  );
+  if (match) {
+    const [, yyyy, mm, dd, hh, min] = match;
+    const d = new Date(
+      Number(yyyy),
+      Number(mm) - 1,
+      Number(dd),
+      Number(hh),
+      Number(min),
+      0
     );
     const t = d.getTime();
     return Number.isNaN(t) ? 0 : t;
@@ -283,11 +335,6 @@ function normalizeNetwork(value) {
 ========================= */
 
 async function postDiscordWebhook(url, payload) {
-  if (!url || url.includes('PASTE_YOUR_EXISTING')) {
-    console.warn('Webhook URL is not configured.');
-    return { ok: false, code: 0 };
-  }
-
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -365,7 +412,7 @@ async function sendInvalidJumpseatWebhook(discordId, lastLocation, dep) {
     embeds: [{
       title: '❌ INVALID JUMPSEAT ORIGIN',
       description:
-        `Hello **${discordId}**, your location does not changed because your origin was incorrect.\n\n` +
+        `Hello **${discordId}**, your location did not change because your origin was incorrect.\n\n` +
         `📍 **Last known position:** \`${lastLocation}\`\n` +
         `🛫 **Attempted departure:** \`${dep}\``,
       color: 15548997,
@@ -660,10 +707,10 @@ async function sendDailyResultAnnouncement() {
     .setFooter({ text: 'Sky Center • Official Daily Operation' })
     .setTimestamp();
 
-    await channel.send({
-      content: roleMention(),
-      embeds: [resultEmbed]
-    });
+  await channel.send({
+    content: roleMention(),
+    embeds: [resultEmbed]
+  });
 
   console.log('Daily final winner announcement sent');
 }
@@ -870,6 +917,7 @@ async function addPilotRow({ discordId, baseAirport, active, notes, inServer, la
     spreadsheetId: SPREADSHEET_ID,
     range: `${PILOTS_SHEET_NAME}!A:F`,
     valueInputOption: 'USER_ENTERED',
+    insertDataOption: 'INSERT_ROWS',
     requestBody: {
       values: [[discordId, baseAirport, active, notes, inServer, lastSync]]
     }
@@ -907,10 +955,27 @@ async function upsertPilotFromMember(member) {
 
   if (existing) {
     const oldBase = norm(existing.values[1]).toUpperCase();
-    if (!payload.baseAirport && oldBase) payload.baseAirport = oldBase;
+    const oldActive = norm(existing.values[2]).toUpperCase() || 'YES';
+    const oldNotes = norm(existing.values[3]) || 'Bot sync';
+    const oldInServer = norm(existing.values[4]).toUpperCase() || 'YES';
 
-    const oldNotes = norm(existing.values[3]);
-    if (oldNotes && oldNotes !== 'Bot sync') payload.notes = oldNotes;
+    if (!payload.baseAirport && oldBase) {
+      payload.baseAirport = oldBase;
+    }
+
+    if (oldNotes && oldNotes !== 'Bot sync') {
+      payload.notes = oldNotes;
+    }
+
+    const hasMeaningfulChange =
+      payload.baseAirport !== oldBase ||
+      payload.active !== oldActive ||
+      payload.notes !== oldNotes ||
+      payload.inServer !== oldInServer;
+
+    if (!hasMeaningfulChange) {
+      return;
+    }
 
     await updatePilotRow(existing.rowNumber, payload);
     console.log(`Updated pilot: ${discordId} -> ${payload.baseAirport || '(no base)'}`);
@@ -1086,12 +1151,12 @@ async function buildPilotStats() {
     let lastPosition = pilot.base || '';
     let lastPositionTime = 0;
 
-    if (flight.lastFlightTime >= lastPositionTime && flight.lastFlightArrival) {
+    if (flight.lastFlightTime > lastPositionTime && flight.lastFlightArrival) {
       lastPosition = flight.lastFlightArrival;
       lastPositionTime = flight.lastFlightTime;
     }
 
-    if (jump.lastJumpseatTime >= lastPositionTime && jump.lastJumpseatArrival) {
+    if (jump.lastJumpseatTime > lastPositionTime && jump.lastJumpseatArrival) {
       lastPosition = jump.lastJumpseatArrival;
       lastPositionTime = jump.lastJumpseatTime;
     }
@@ -1149,6 +1214,7 @@ async function appendFlightReportRow(rowValues) {
     spreadsheetId: SPREADSHEET_ID,
     range: `${FLIGHTS_SHEET_NAME}!A:N`,
     valueInputOption: 'USER_ENTERED',
+    insertDataOption: 'INSERT_ROWS',
     requestBody: {
       values: [rowValues]
     }
@@ -1160,6 +1226,7 @@ async function appendJumpseatRow(rowValues) {
     spreadsheetId: SPREADSHEET_ID,
     range: `${JUMPSEAT_SHEET_NAME}!A:H`,
     valueInputOption: 'USER_ENTERED',
+    insertDataOption: 'INSERT_ROWS',
     requestBody: {
       values: [rowValues]
     }
@@ -1838,9 +1905,15 @@ client.on(Events.GuildMemberAdd, async (member) => {
   }
 });
 
-client.on(Events.GuildMemberUpdate, async (_oldMember, newMember) => {
+client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
   try {
     if (newMember.user.bot) return;
+
+    const oldBaseRoleId = getBaseRoleIdFromMember(oldMember);
+    const newBaseRoleId = getBaseRoleIdFromMember(newMember);
+
+    if (oldBaseRoleId === newBaseRoleId) return;
+
     await upsertPilotFromMember(newMember);
   } catch (err) {
     console.error('GuildMemberUpdate error:', err.message);
