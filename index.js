@@ -145,18 +145,18 @@ function parseTimestamp(value) {
   const raw = norm(value);
   if (!raw) return 0;
 
-  // 1) Native parse first (works for ISO strings)
+  // ISO / native parse
   const native = new Date(raw);
   const nativeTime = native.getTime();
   if (!Number.isNaN(nativeTime)) return nativeTime;
 
-  // 2) dd/mm/yyyy hh:mm
-  const matchDateTime = raw.match(
+  // dd/mm/yyyy hh:mm or dd/mm/yyyy
+  const match1 = raw.match(
     /^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:\s+(\d{1,2}):(\d{2}))?$/
   );
 
-  if (matchDateTime) {
-    const [, dd, mm, yyyy, hh = '0', min = '0'] = matchDateTime;
+  if (match1) {
+    const [, dd, mm, yyyy, hh = '0', min = '0'] = match1;
     const d = new Date(
       Number(yyyy),
       Number(mm) - 1,
@@ -168,13 +168,13 @@ function parseTimestamp(value) {
     return Number.isNaN(t) ? 0 : t;
   }
 
-  // 3) yyyy-mm-dd hh:mm
-  const matchIsoLike = raw.match(
+  // yyyy-mm-dd hh:mm or yyyy-mm-dd
+  const match2 = raw.match(
     /^(\d{4})-(\d{1,2})-(\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?$/
   );
 
-  if (matchIsoLike) {
-    const [, yyyy, mm, dd, hh = '0', min = '0'] = matchIsoLike;
+  if (match2) {
+    const [, yyyy, mm, dd, hh = '0', min = '0'] = match2;
     const d = new Date(
       Number(yyyy),
       Number(mm) - 1,
